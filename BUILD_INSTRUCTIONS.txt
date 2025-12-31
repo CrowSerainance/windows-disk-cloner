@@ -1,0 +1,103 @@
+Windows Disk Cloner - Build Instructions
+========================================
+
+This document explains how to build the Windows Disk Cloner application
+from source and create distributable executables and installers.
+
+PREREQUISITES:
+=============
+
+1. Python 3.8 or later
+   - Download from: https://www.python.org/downloads/
+   - Make sure to add Python to PATH during installation
+
+2. .NET 6.0 SDK or later (optional, for C# version)
+   - Download from: https://dotnet.microsoft.com/download
+   - Only needed if you want to build the C# version
+
+3. Inno Setup Compiler (optional, for installer)
+   - Download from: https://jrsoftware.org/isdl.php
+   - Only needed if you want to create an installer
+
+QUICK BUILD:
+===========
+
+Simply run the build script:
+    build_exe.bat
+
+This will:
+1. Install Python dependencies
+2. Build Python CLI version (DiskClonerCLI.exe)
+3. Build Python GUI version (DiskClonerGUI.exe)
+4. Build C# version (if .NET SDK is installed)
+5. Create installer (if Inno Setup is installed)
+
+All executables will be placed in the 'dist' folder.
+
+MANUAL BUILD STEPS:
+==================
+
+Step 1: Install Python Dependencies
+------------------------------------
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
+    python -m pip install pyinstaller
+
+Step 2: Build Python CLI Version
+---------------------------------
+    pyinstaller --onefile --name "DiskClonerCLI" --console disk_cloner.py
+
+Step 3: Build Python GUI Version
+---------------------------------
+    pyinstaller --onefile --name "DiskClonerGUI" --windowed disk_cloner_gui.py
+
+Step 4: Build C# Version (Optional)
+------------------------------------
+    dotnet restore
+    dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+
+Step 5: Create Installer (Optional)
+------------------------------------
+    iscc create_installer.iss
+
+TROUBLESHOOTING:
+===============
+
+Issue: "Python not found"
+Solution: Make sure Python is installed and added to PATH
+
+Issue: "Module not found" errors
+Solution: Run: pip install -r requirements.txt
+
+Issue: PyInstaller fails with "hidden import" errors
+Solution: The build script includes all necessary hidden imports.
+         If you still get errors, add them manually to pyinstaller command.
+
+Issue: Installer creation fails
+Solution: Make sure Inno Setup is installed and 'iscc' is in PATH
+
+Issue: Executable is too large
+Solution: This is normal - PyInstaller bundles Python runtime and all dependencies.
+         The GUI version is typically 30-50 MB, CLI version is 20-40 MB.
+
+DISTRIBUTION:
+============
+
+For distribution, you can:
+1. Distribute the .exe files directly from the 'dist' folder
+2. Use the installer (WindowsDiskCloner-Setup.exe) for easier installation
+3. Include the README.md and LICENSE files
+
+IMPORTANT NOTES:
+===============
+
+- All executables MUST be run as Administrator
+- The application requires Windows 10 or later (64-bit)
+- Users must have administrator privileges to use disk cloning features
+- Always test the built executables before distribution
+
+CREDITS:
+=======
+
+Inspired by Clonezilla (https://clonezilla.org/)
+Built with Python, PyInstaller, and Inno Setup

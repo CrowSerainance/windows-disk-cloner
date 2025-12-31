@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0-windows</TargetFramework>
+    <RootNamespace>WindowsDiskCloner</RootNamespace>
+    <AssemblyName>WindowsDiskCloner</AssemblyName>
+    <Version>1.0.0</Version>
+    <Authors>Custom Build</Authors>
+    <Company>Custom Build</Company>
+    <Product>Windows Disk Cloner</Product>
+    <Description>Disk cloning utility inspired by Clonezilla for Windows</Description>
+    <Copyright>GPL License</Copyright>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishReadyToRun>true</PublishReadyToRun>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>
