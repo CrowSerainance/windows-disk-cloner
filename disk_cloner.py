@@ -16,6 +16,7 @@ import json
 import hashlib
 import shutil
 import time
+import re
 from pathlib import Path
 from datetime import datetime
 import argparse
@@ -122,9 +123,10 @@ class DiskCloner:
         partitions = []
 
         try:
+            disk_index = int(disk_index)
             wmi_client = self._get_wmi_client()
             for partition in wmi_client.Win32_DiskPartition():
-                if partition.DiskIndex == disk_index:
+                if int(partition.DiskIndex) == disk_index:
                     part_info = {
                         'index': partition.Index,
                         'device_id': partition.DeviceID,
@@ -378,9 +380,10 @@ class DiskCloner:
         }
 
         # Get disk info
+        disk_index = int(disk_index)
         wmi_client = self._get_wmi_client()
         for disk in wmi_client.Win32_DiskDrive():
-            if disk.Index == disk_index:
+            if int(disk.Index) == disk_index:
                 metadata['disk'] = {
                     'model': disk.Model,
                     'size': disk.Size,
@@ -401,6 +404,89 @@ class DiskCloner:
         except Exception as e:
             self.log(f"Error saving metadata: {e}", "ERROR")
             return False
+
+
+    def get_disk_partition_style(self, disk_index, source_partitions=None):
+        """
+        Return the partition style for a disk as 'GPT', 'MBR', or 'UNKNOWN'.
+
+        Prefer the modern MSFT_Disk.PartitionStyle value because partition-type
+        strings reported by Win32_DiskPartition are inconsistent across Windows
+        versions and locales. Fall back to conservative partition heuristics when
+        the Storage namespace is not available.
+        """
+        disk_index = int(disk_index)
+
+        try:
+            import pythoncom
+            try:
+                pythoncom.CoInitialize()
+            except pythoncom.com_error:
+                pass
+            storage_client = wmi.WMI(namespace=r"root\Microsoft\Windows\Storage")
+            for disk in storage_client.MSFT_Disk(Number=disk_index):
+                style = str(getattr(disk, 'PartitionStyle', '') or '').strip().upper()
+                style_map = {
+                    '1': 'MBR',
+                    '2': 'GPT',
+                    'MBR': 'MBR',
+                    'GPT': 'GPT',
+                }
+                if style in style_map:
+                    self.log(f"Detected disk type from MSFT_Disk: {style_map[style]}")
+                    return style_map[style]
+        except Exception as e:
+            self.log(f"MSFT_Disk partition style lookup unavailable: {e}", "WARNING")
+
+        partitions = source_partitions if source_partitions is not None else self.get_disk_partitions(disk_index)
+        gpt_indicators = []
+        mbr_indicators = []
+
+        for p in partitions:
+            p_type = (p.get('type', '') or '').upper()
+            p_fs = (p.get('file_system', '') or '').upper()
+            p_size_mb = int(p.get('size', 0)) // (1024 * 1024) if p.get('size') else 0
+            p_drive = p.get('drive_letter')
+
+            if 'GPT' in p_type or 'EFI' in p_type:
+                gpt_indicators.append(f"EFI/GPT partition type detected: {p_type}")
+            elif 'MSR' in p_type or 'RESERVED' in p_type:
+                gpt_indicators.append(f"MSR partition detected: {p_type}")
+            elif p_fs == 'FAT32' and 50 < p_size_mb < 1000 and not p_drive:
+                gpt_indicators.append(f"Small FAT32 system partition ({p_size_mb}MB, no drive letter)")
+            elif 'MBR' in p_type or 'IFS' in p_type or 'INSTALLABLE FILE SYSTEM' in p_type:
+                mbr_indicators.append(f"MBR-style partition type detected: {p_type}")
+
+        if gpt_indicators:
+            self.log("Detected disk type: GPT")
+            for indicator in gpt_indicators:
+                self.log(f"  Reason: {indicator}")
+            return 'GPT'
+
+        if mbr_indicators or partitions:
+            self.log("Detected disk type: MBR")
+            for indicator in mbr_indicators:
+                self.log(f"  Reason: {indicator}")
+            if not mbr_indicators:
+                self.log("  Reason: no GPT indicators found")
+            return 'MBR'
+
+        self.log("Unable to determine disk partition style", "WARNING")
+        return 'UNKNOWN'
+
+    def _sanitize_volume_label(self, label, default='Data'):
+        """Sanitize a volume label for diskpart format commands."""
+        clean = re.sub(r'[^\w ._-]', '', str(label or default), flags=re.UNICODE).strip()[:32]
+        return clean or default
+
+    def _normalize_filesystem_for_diskpart(self, filesystem):
+        """Return a filesystem name accepted by diskpart, defaulting to NTFS."""
+        fs = (filesystem or 'NTFS').upper()
+        supported = {'NTFS', 'FAT32', 'EXFAT', 'REFS'}
+        if fs not in supported:
+            self.log(f"Unsupported/unknown filesystem '{filesystem}', formatting as NTFS", "WARNING")
+            return 'NTFS'
+        return fs
 
     def prepare_target_disk(self, target_disk_index, source_disk_index):
         """
@@ -442,59 +528,14 @@ class DiskCloner:
             self.log("No source partitions to replicate!", "ERROR")
             return False
 
-        # Check if source is GPT or MBR
-        # GPT disks have specific partition types that MBR disks don't have:
-        #   - EFI System Partition (ESP) - FAT32, typically 100-550MB
-        #   - Microsoft Reserved Partition (MSR) - no filesystem, 16-128MB
-        #   - Recovery partitions with GPT-specific attributes
-        #
-        # Detection strategy:
-        #   1. Look for explicit "EFI" or "GPT" in partition type strings
-        #   2. Look for small FAT32 partitions without drive letters (likely ESP)
-        #   3. Look for "MSR" or "Reserved" partition types
-        #   4. Look for small partitions (< 600MB) without drive letters (system partitions)
-        is_gpt = False
-        gpt_indicators = []  # Track why we think it's GPT for logging
-        
-        for p in source_partitions:
-            p_type = (p.get('type', '') or '').upper()
-            p_fs = (p.get('file_system', '') or '').upper()
-            p_size_mb = int(p.get('size', 0)) // (1024 * 1024) if p.get('size') else 0
-            p_drive = p.get('drive_letter')
-
-            # Check 1: Explicit EFI or GPT in partition type
-            if 'EFI' in p_type or 'GPT' in p_type:
-                is_gpt = True
-                gpt_indicators.append(f"EFI/GPT partition type detected: {p_type}")
-                break
-            
-            # Check 2: MSR (Microsoft Reserved) partition - only exists on GPT disks
-            if 'MSR' in p_type or 'RESERVED' in p_type:
-                is_gpt = True
-                gpt_indicators.append(f"MSR partition detected: {p_type}")
-                break
-            
-            # Check 3: Small FAT32 partition without drive letter (likely EFI System Partition)
-            # EFI partitions are typically 100-550MB, FAT32 formatted, and hidden (no drive letter)
-            if p_fs == 'FAT32' and 50 < p_size_mb < 1000 and not p_drive:
-                is_gpt = True
-                gpt_indicators.append(f"Small FAT32 system partition ({p_size_mb}MB, no drive letter)")
-                break
-            
-            # Check 4: Small partition without drive letter that's not explicitly MBR-style
-            # This catches edge cases where WMI doesn't report the partition type correctly
-            if p_size_mb > 0 and p_size_mb < 600 and not p_drive and 'RECOVERY' not in p_type:
-                is_gpt = True
-                gpt_indicators.append(f"Small system partition ({p_size_mb}MB, no drive letter, type: {p_type or 'Unknown'})")
-                break
-
-        # Log detection results
-        if is_gpt:
-            self.log(f"Detected disk type: GPT")
-            for indicator in gpt_indicators:
-                self.log(f"  Reason: {indicator}")
-        else:
-            self.log(f"Detected disk type: MBR (no GPT indicators found)")
+        # Check if source is GPT or MBR. Prefer MSFT_Disk.PartitionStyle,
+        # because Win32_DiskPartition.Type strings are inconsistent and can
+        # make MBR "System Reserved" partitions look like EFI partitions.
+        partition_style = self.get_disk_partition_style(source_disk_index, source_partitions)
+        if partition_style == 'UNKNOWN':
+            self.log("Cannot safely prepare target disk without knowing source partition style", "ERROR")
+            return False
+        is_gpt = partition_style == 'GPT'
 
         # Create diskpart script to clean and prepare target disk
         diskpart_script = f"""select disk {target_disk_index}
@@ -518,11 +559,14 @@ clean
                 self.log(f"Skipping partition {i} with size < 1MB", "WARNING")
                 continue
 
-            # Detect EFI partition: explicit type, or small partition without drive letter on GPT disk
-            is_efi_partition = (
+            # Detect EFI partition only on GPT disks. Do not treat generic
+            # "SYSTEM" text as EFI because MBR System Reserved partitions are
+            # NTFS primary partitions and must not be recreated as ESPs.
+            is_efi_partition = is_gpt and (
                 'EFI' in partition_type or
-                'SYSTEM' in partition_type or
-                (is_gpt and size_mb > 0 and size_mb < 600 and not partition.get('drive_letter') and 'RECOVERY' not in partition_type)
+                (size_mb > 0 and size_mb < 600 and
+                 (partition.get('file_system') or '').upper() == 'FAT32' and
+                 not partition.get('drive_letter') and 'RECOVERY' not in partition_type)
             )
 
             if is_efi_partition:
@@ -535,31 +579,30 @@ assign
 """
                 efi_partition_created = True
                 self.log(f"  Creating EFI partition ({efi_size} MB)")
-            elif 'MSR' in partition_type or 'RESERVED' in partition_type:
-                # Microsoft Reserved Partition - typically 16MB on MBR, 128MB on GPT
-                # This partition has no filesystem and no drive letter
+            elif is_gpt and ('MSR' in partition_type or 'RESERVED' in partition_type):
+                # Microsoft Reserved Partition - GPT only. MBR reserved/system
+                # partitions should be handled as regular primary partitions.
                 msr_size = max(size_mb, 16)
                 diskpart_script += f"""create partition msr size={msr_size}
 """
                 self.log(f"  Creating MSR partition ({msr_size} MB)")
             elif 'RECOVERY' in partition_type:
-                # Recovery partition with GPT-specific attributes
-                # The GUID and attributes mark it as a recovery partition
+                # Recovery partition. GPT and MBR use different IDs; applying
+                # GPT attributes on an MBR disk causes diskpart failures.
                 diskpart_script += f"""create partition primary size={size_mb}
 format fs=ntfs quick label="Recovery"
-set id="de94bba4-06d1-4d40-a16a-bfd50179d6ac"
+"""
+                if is_gpt:
+                    diskpart_script += """set id="de94bba4-06d1-4d40-a16a-bfd50179d6ac"
 gpt attributes=0x8000000000000001
 """
+                else:
+                    diskpart_script += "set id=27\n"
                 self.log(f"  Creating Recovery partition ({size_mb} MB)")
             else:
                 # Regular data partition (Windows, Data, etc.)
-                fs = (partition.get('file_system') or 'NTFS').upper()
-                label = partition.get('label') or 'Data'
-                
-                # Sanitize label: max 32 chars for NTFS, only alphanumeric and basic punctuation
-                label = ''.join(c for c in label[:32] if c.isalnum() or c in ' -_')
-                if not label:
-                    label = 'Data'
+                fs = self._normalize_filesystem_for_diskpart(partition.get('file_system'))
+                label = self._sanitize_volume_label(partition.get('label'), 'Data')
 
                 # Use remaining space for the last partition to maximize disk usage
                 is_last = (i == len(source_partitions) - 1)

@@ -421,6 +421,101 @@ namespace WindowsDiskCloner
         /// <summary>
         /// Prepare target disk with partition structure matching source disk
         /// </summary>
+
+        private string GetDiskPartitionStyle(int diskIndex, List<PartitionInfo> sourcePartitions = null)
+        {
+            try
+            {
+                var scope = new ManagementScope(@"\\.\root\Microsoft\Windows\Storage");
+                scope.Connect();
+                using (var searcher = new ManagementObjectSearcher(scope, new ObjectQuery($"SELECT PartitionStyle FROM MSFT_Disk WHERE Number = {diskIndex}")))
+                {
+                    foreach (ManagementObject disk in searcher.Get())
+                    {
+                        string style = disk["PartitionStyle"]?.ToString()?.Trim().ToUpperInvariant();
+                        var styleMap = new Dictionary<string, string>
+                        {
+                            { "1", "MBR" },
+                            { "2", "GPT" },
+                            { "MBR", "MBR" },
+                            { "GPT", "GPT" }
+                        };
+
+                        if (!string.IsNullOrEmpty(style) && styleMap.ContainsKey(style))
+                        {
+                            Log($"Detected disk type from MSFT_Disk: {styleMap[style]}");
+                            return styleMap[style];
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"MSFT_Disk partition style lookup unavailable: {ex.Message}", "WARNING");
+            }
+
+            var partitions = sourcePartitions ?? GetDiskPartitions(diskIndex);
+            var gptIndicators = new List<string>();
+            var mbrIndicators = new List<string>();
+
+            foreach (var p in partitions)
+            {
+                string pType = (p.Type ?? "").ToUpperInvariant();
+                string pFs = (p.FileSystem ?? "").ToUpperInvariant();
+                long pSizeMB = p.Size / (1024 * 1024);
+
+                if (pType.Contains("GPT") || pType.Contains("EFI"))
+                    gptIndicators.Add($"EFI/GPT partition type detected: {pType}");
+                else if (pType.Contains("MSR") || pType.Contains("RESERVED"))
+                    gptIndicators.Add($"MSR partition detected: {pType}");
+                else if (pFs == "FAT32" && pSizeMB > 50 && pSizeMB < 1000 && string.IsNullOrEmpty(p.DriveLetter))
+                    gptIndicators.Add($"Small FAT32 system partition ({pSizeMB}MB, no drive letter)");
+                else if (pType.Contains("MBR") || pType.Contains("IFS") || pType.Contains("INSTALLABLE FILE SYSTEM"))
+                    mbrIndicators.Add($"MBR-style partition type detected: {pType}");
+            }
+
+            if (gptIndicators.Count > 0)
+            {
+                Log("Detected disk type: GPT");
+                foreach (var indicator in gptIndicators)
+                    Log($"  Reason: {indicator}");
+                return "GPT";
+            }
+
+            if (mbrIndicators.Count > 0 || partitions.Count > 0)
+            {
+                Log("Detected disk type: MBR");
+                foreach (var indicator in mbrIndicators)
+                    Log($"  Reason: {indicator}");
+                if (mbrIndicators.Count == 0)
+                    Log("  Reason: no GPT indicators found");
+                return "MBR";
+            }
+
+            Log("Unable to determine disk partition style", "WARNING");
+            return "UNKNOWN";
+        }
+
+        private string NormalizeFilesystemForDiskpart(string filesystem)
+        {
+            string fs = (filesystem ?? "NTFS").ToUpperInvariant();
+            var supported = new HashSet<string> { "NTFS", "FAT32", "EXFAT", "REFS" };
+            if (!supported.Contains(fs))
+            {
+                Log($"Unsupported/unknown filesystem '{filesystem}', formatting as NTFS", "WARNING");
+                return "NTFS";
+            }
+            return fs;
+        }
+
+        private string SanitizeVolumeLabel(string label, string defaultLabel = "Data")
+        {
+            string raw = string.IsNullOrWhiteSpace(label) ? defaultLabel : label;
+            string clean = new string(raw.Take(32).Where(c =>
+                char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_' || c == '.').ToArray()).Trim();
+            return string.IsNullOrEmpty(clean) ? defaultLabel : clean;
+        }
+
         public bool PrepareTargetDisk(int targetDiskIndex, int sourceDiskIndex)
         {
             Log($"Preparing target disk {targetDiskIndex}...");
@@ -433,67 +528,16 @@ namespace WindowsDiskCloner
                 return false;
             }
 
-            // Check if source is GPT or MBR
-            // GPT disks have specific partition types that MBR disks don't have:
-            //   - EFI System Partition (ESP) - FAT32, typically 100-550MB
-            //   - Microsoft Reserved Partition (MSR) - no filesystem, 16-128MB
-            //   - Recovery partitions with GPT-specific attributes
-            bool isGpt = false;
-            var gptIndicators = new List<string>();
-            
-            foreach (var p in sourcePartitions)
+            // Check if source is GPT or MBR. Prefer MSFT_Disk.PartitionStyle,
+            // because Win32_DiskPartition.Type strings are inconsistent and can
+            // make MBR "System Reserved" partitions look like EFI partitions.
+            string partitionStyle = GetDiskPartitionStyle(sourceDiskIndex, sourcePartitions);
+            if (partitionStyle == "UNKNOWN")
             {
-                string pType = (p.Type ?? "").ToUpper();
-                string pFs = (p.FileSystem ?? "").ToUpper();
-                long pSizeMB = p.Size / (1024 * 1024);
-                string pDrive = p.DriveLetter;
-
-                // Check 1: Explicit EFI or GPT in partition type
-                if (pType.Contains("EFI") || pType.Contains("GPT"))
-                {
-                    isGpt = true;
-                    gptIndicators.Add($"EFI/GPT partition type detected: {pType}");
-                    break;
-                }
-                
-                // Check 2: MSR (Microsoft Reserved) partition - only exists on GPT disks
-                if (pType.Contains("MSR") || pType.Contains("RESERVED"))
-                {
-                    isGpt = true;
-                    gptIndicators.Add($"MSR partition detected: {pType}");
-                    break;
-                }
-                
-                // Check 3: Small FAT32 partition without drive letter (likely EFI System Partition)
-                if (pFs == "FAT32" && pSizeMB > 50 && pSizeMB < 1000 && string.IsNullOrEmpty(pDrive))
-                {
-                    isGpt = true;
-                    gptIndicators.Add($"Small FAT32 system partition ({pSizeMB}MB, no drive letter)");
-                    break;
-                }
-                
-                // Check 4: Small partition without drive letter that's not recovery
-                if (pSizeMB > 0 && pSizeMB < 600 && string.IsNullOrEmpty(pDrive) && !pType.Contains("RECOVERY"))
-                {
-                    isGpt = true;
-                    gptIndicators.Add($"Small system partition ({pSizeMB}MB, no drive letter, type: {pType})");
-                    break;
-                }
+                Log("Cannot safely prepare target disk without knowing source partition style", "ERROR");
+                return false;
             }
-
-            // Log detection results
-            if (isGpt)
-            {
-                Log($"Detected disk type: GPT");
-                foreach (var indicator in gptIndicators)
-                {
-                    Log($"  Reason: {indicator}");
-                }
-            }
-            else
-            {
-                Log($"Detected disk type: MBR (no GPT indicators found)");
-            }
+            bool isGpt = partitionStyle == "GPT";
 
             // Create diskpart script
             var diskpartScript = $@"select disk {targetDiskIndex}
@@ -516,11 +560,14 @@ clean
                     continue;
                 }
 
-                // Detect EFI partition: explicit type, or small partition without drive letter on GPT disk
-                bool isEfiPartition = (
+                // Detect EFI partition only on GPT disks. Do not treat generic
+                // "SYSTEM" text as EFI because MBR System Reserved partitions are
+                // NTFS primary partitions and must not be recreated as ESPs.
+                bool isEfiPartition = isGpt && (
                     partType.Contains("EFI") ||
-                    partType.Contains("SYSTEM") ||
-                    (isGpt && sizeMB > 0 && sizeMB < 600 && string.IsNullOrEmpty(partition.DriveLetter) && !partType.Contains("RECOVERY"))
+                    (sizeMB > 0 && sizeMB < 600 &&
+                     (partition.FileSystem ?? "").ToUpperInvariant() == "FAT32" &&
+                     string.IsNullOrEmpty(partition.DriveLetter) && !partType.Contains("RECOVERY"))
                 );
 
                 if (isEfiPartition)
@@ -535,10 +582,10 @@ assign
                     _efiPartitionCreated = true;
                     Log($"  Creating EFI partition ({efiSize} MB)");
                 }
-                else if (partType.Contains("MSR") || partType.Contains("RESERVED"))
+                else if (isGpt && (partType.Contains("MSR") || partType.Contains("RESERVED")))
                 {
-                    // Microsoft Reserved Partition - typically 16MB on MBR, 128MB on GPT
-                    // This partition has no filesystem and no drive letter
+                    // Microsoft Reserved Partition - GPT only. MBR reserved/system
+                    // partitions should be handled as regular primary partitions.
                     long msrSize = Math.Max(sizeMB, 16);
                     diskpartScript += $@"create partition msr size={msrSize}
 ";
@@ -546,24 +593,28 @@ assign
                 }
                 else if (partType.Contains("RECOVERY"))
                 {
-                    // Recovery partition with GPT-specific attributes
+                    // Recovery partition. GPT and MBR use different IDs; applying
+                    // GPT attributes on an MBR disk causes diskpart failures.
                     diskpartScript += $@"create partition primary size={sizeMB}
 format fs=ntfs quick label=""Recovery""
-set id=""de94bba4-06d1-4d40-a16a-bfd50179d6ac""
+";
+                    if (isGpt)
+                    {
+                        diskpartScript += @"set id=""de94bba4-06d1-4d40-a16a-bfd50179d6ac""
 gpt attributes=0x8000000000000001
 ";
+                    }
+                    else
+                    {
+                        diskpartScript += "set id=27\n";
+                    }
                     Log($"  Creating Recovery partition ({sizeMB} MB)");
                 }
                 else
                 {
                     // Regular data partition (Windows, Data, etc.)
-                    string fs = (partition.FileSystem ?? "NTFS").ToUpper();
-                    string label = partition.VolumeLabel ?? "Data";
-
-                    // Sanitize label: max 32 chars, only alphanumeric and basic punctuation
-                    label = new string(label.Take(32).Where(c =>
-                        char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_').ToArray());
-                    if (string.IsNullOrEmpty(label)) label = "Data";
+                    string fs = NormalizeFilesystemForDiskpart(partition.FileSystem);
+                    string label = SanitizeVolumeLabel(partition.VolumeLabel, "Data");
 
                     // Use remaining space for the last partition to maximize disk usage
                     bool isLast = (i == sourcePartitions.Count - 1);
