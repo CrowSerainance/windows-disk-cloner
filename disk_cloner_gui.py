@@ -445,7 +445,7 @@ class DiskClonerGUI:
         mode_frame = ttk.LabelFrame(frame, text="Clone Mode", padding="4")
         mode_frame.pack(fill=tk.X, pady=2)
 
-        self.raw_mode_var = tk.BooleanVar(value=False)  # Default to non-RAW mode (more compatible)
+        self.raw_mode_var = tk.BooleanVar(value=True)  # Default to RAW mode for complete OS disk clones
         raw_mode_check = ttk.Checkbutton(
             mode_frame,
             text="Use RAW mode (sector-by-sector copy)",
@@ -455,9 +455,9 @@ class DiskClonerGUI:
 
         ttk.Label(
             mode_frame,
-            text="RAW mode: Copies everything sector-by-sector including partition table.\n"
-                 "May fail if target disk cannot be taken offline (Windows protection).\n"
-                 "Non-RAW mode (default): Uses filesystem copying - more compatible, still clones OS and boot files.",
+            text="RAW mode (default/recommended for C: OS clones): sector-by-sector, most complete.\n"
+                 "Best from Windows Recovery/USB so the source and target are not actively in use.\n"
+                 "Unchecked fallback: robocopy file-level copy; less exact for a live OS disk.",
             foreground="gray",
             font=("Arial", 8)
         ).pack(anchor=tk.W, pady=2)
