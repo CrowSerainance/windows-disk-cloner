@@ -141,10 +141,11 @@ See `BUILD_INSTRUCTIONS.txt` for detailed build information.
    - Select source disk (disk to copy FROM)
    - Select target disk (disk to copy TO - **will be erased!**)
    - Choose clone mode:
-     - **RAW mode (Recommended)**: Sector-by-sector copy, most reliable
-       - Copies **everything** including OS, boot records, partition table
+     - **RAW mode (Default / Recommended)**: Sector-by-sector copy, most complete for OS-drive replacement
+       - Copies **everything** up to the source disk size, including hidden partitions, OS files, boot records, and partition table
+       - Best run from Windows Recovery/USB so the source OS is not changing during the copy
        - Automatically configures UEFI/BIOS boot loader after cloning
-       - Ensures the cloned Windows OS is fully bootable
+     - **Filesystem mode**: robocopy fallback if RAW access is blocked; less exact for a live Windows OS disk
    - **Optional**: Enable "Resize last partition to fill all available disk space"
      - This extends the last data partition to use all available storage
      - Useful when target disk is larger than source disk
@@ -173,10 +174,16 @@ python disk_cloner.py --list-disks
 python disk_cloner.py --clone-drive C: --output E:\Backups
 ```
 
-#### Clone disk to disk:
+#### Clone disk to disk using RAW mode (default, best for clean-slate OS-drive replacement):
 ```bash
 python disk_cloner.py --clone-disk 0 1
-# Clones Disk 0 to Disk 1 (WARNING: Disk 1 will be erased!)
+# Sector-by-sector clones Disk 0 to Disk 1 (WARNING: Disk 1 will be erased!)
+```
+
+#### Fallback file-level disk clone if RAW access is blocked:
+```bash
+python disk_cloner.py --clone-disk 0 1 --filesystem-mode
+# Uses robocopy; not an exact sector copy of a live Windows OS disk
 ```
 
 #### Additional options:
@@ -204,7 +211,7 @@ WindowsDiskCloner.exe
 
 ### ✅ YES - Complete OS Cloning with Full Boot Support:
 
-**CONFIRMED: This tool CAN clone your complete C: drive including OS and make it bootable as your main drive!**
+**For a clean-slate replacement drive, use disk-to-disk RAW mode rather than drive-to-image or filesystem mode.** RAW mode is the only mode intended to aggressively copy the whole OS disk layout and contents.
 
 **What gets cloned (COMPLETE list):**
 - ✅ **Complete Windows OS** - All files, registry, settings, programs, user data
@@ -224,8 +231,9 @@ WindowsDiskCloner.exe
 
 **⚠️ IMPORTANT:** For best results when cloning a system drive (C:):
 1. **Recommended**: Boot from Windows Recovery or Clonezilla Live USB
-2. **Alternative**: Clone while Windows is running (may have locked files)
-3. **After cloning**: Select the new disk from BIOS/UEFI boot menu to use as main drive
+2. **Alternative**: Clone while Windows is running in RAW mode (more complete than filesystem mode, but the live source can change during the copy)
+3. **Fallback only**: Filesystem mode uses robocopy and is not an exact sector-level OS clone
+4. **After cloning**: Select the new disk from BIOS/UEFI boot menu to use as main drive
 
 **See `OS_CLONING_CONFIRMATION.md` for complete details.**
 
@@ -427,8 +435,8 @@ For production system disk cloning, we recommend using the official **Clonezilla
 Contributions are welcome! This is a custom build for educational purposes and real-world use.
 
 Areas for improvement:
-- Add support for VSS (Volume Shadow Copy) to clone running system
-- Implement raw disk cloning (sector-by-sector)
+- Add support for VSS (Volume Shadow Copy) to make filesystem-mode clones more consistent on running systems
+- Add post-clone boot verification for RAW disk clones
 - Add restore functionality
 - Support for more filesystems (ext4, exFAT via drivers)
 - Compression support (gzip, zstd)

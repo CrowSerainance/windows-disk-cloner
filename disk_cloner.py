@@ -787,7 +787,7 @@ offline disk
                     if volumes_dismounted > 0:
                         self.log(f"Successfully dismounted {volumes_dismounted} volume(s) on target disk", "INFO")
                     self.log("We'll attempt to clone without taking it offline", "INFO")
-                    self.log("If this fails, try using non-RAW mode or boot from Recovery/USB", "INFO")
+                    self.log("If this fails, boot from Recovery/USB for full RAW cloning; filesystem mode is only a fallback", "INFO")
                 else:
                     self.log(f"Warning: Could not fully prepare disk: {error_output}", "WARNING")
                     if volumes_dismounted > 0:
@@ -909,12 +909,13 @@ try {{
         Write-Host "  - Click 'Remove' (don't try to take disk offline)"
         Write-Host "  - Then try cloning again"
         Write-Host ""
-        Write-Host "OPTION 2: Use non-RAW mode"
-        Write-Host "  - Uncheck 'Use RAW mode' in the GUI"
-        Write-Host "  - This uses filesystem copying (doesn't need disk offline)"
+        Write-Host "OPTION 2: Boot from Windows Recovery or Clonezilla Live USB"
+        Write-Host "  - This is the most reliable method for complete system disk cloning"
+        Write-Host "  - The source and target disks will not be protected by the running OS"
         Write-Host ""
-        Write-Host "OPTION 3: Boot from Windows Recovery or Clonezilla Live USB"
-        Write-Host "  - This is the most reliable method for system disk cloning"
+        Write-Host "OPTION 3: Use non-RAW mode only as a file-level fallback"
+        Write-Host "  - Uncheck 'Use RAW mode' in the GUI"
+        Write-Host "  - This uses robocopy and is less exact for a live OS disk"
         Write-Host ""
         throw "Cannot open target disk: Access denied. Disk is protected by Windows."
     }}
@@ -1013,17 +1014,15 @@ catch {{
                         self.log("The target disk cannot be accessed for writing.", "ERROR")
                         self.log("", "ERROR")
                         self.log("", "ERROR")
-                        self.log("RECOMMENDED SOLUTION: Use non-RAW mode (EASIEST)", "ERROR")
+                        self.log("BEST SOLUTION: Boot from Windows Recovery or Clonezilla Live USB", "ERROR")
+                        self.log("The disk will not be protected when booted from USB/recovery media,", "ERROR")
+                        self.log("which is the most reliable way to perform a complete RAW OS clone.", "ERROR")
+                        self.log("", "ERROR")
+                        self.log("FALLBACK: Use non-RAW mode only if you accept a file-level copy", "ERROR")
                         self.log("1. In the GUI, UNCHECK 'Use RAW mode' checkbox", "ERROR")
                         self.log("2. Click 'Start Disk Clone' again", "ERROR")
-                        self.log("3. Non-RAW mode uses filesystem copying (robocopy)", "ERROR")
-                        self.log("   - Doesn't require taking disk offline", "ERROR")
-                        self.log("   - Still clones complete OS and boot files", "ERROR")
-                        self.log("   - Works even when Windows protects the disk", "ERROR")
-                        self.log("", "ERROR")
-                        self.log("ALTERNATIVE: Boot from Windows Recovery or Clonezilla Live USB", "ERROR")
-                        self.log("This is the most reliable method for RAW mode cloning.", "ERROR")
-                        self.log("The disk won't be protected when booted from USB.", "ERROR")
+                        self.log("3. Non-RAW mode uses robocopy and may miss live/locked state", "ERROR")
+                        self.log("   such as transient paging/hibernation files and in-flight writes.", "ERROR")
                         self.log("=" * 60, "ERROR")
 
         except subprocess.TimeoutExpired:
@@ -1437,7 +1436,7 @@ extend
             self.log("The disk may still be bootable if boot records were copied correctly.", "INFO")
             return True  # Don't fail the whole operation
 
-    def clone_disk_to_disk(self, source_disk_index, target_disk_index, use_raw_mode=False, resize_partition=False):
+    def clone_disk_to_disk(self, source_disk_index, target_disk_index, use_raw_mode=True, resize_partition=False):
         """
         Clone entire disk to another disk (disk-to-disk mode)
         This is the main function inspired by Clonezilla's disk mode.
@@ -1445,10 +1444,18 @@ extend
         Args:
             source_disk_index: Source disk number
             target_disk_index: Target disk number
-            use_raw_mode: If True, use raw sector-by-sector copy (more reliable but slower)
+            use_raw_mode: If True, use raw sector-by-sector copy (best for complete OS clones)
         """
         if not self.is_admin:
             self.log("ERROR: Administrator privileges required for disk cloning!", "ERROR")
+            return False
+
+        source_disk_index = int(source_disk_index)
+        target_disk_index = int(target_disk_index)
+
+        # Validate source and target are different before either RAW or filesystem mode.
+        if source_disk_index == target_disk_index:
+            self.log("ERROR: Source and target disk cannot be the same!", "ERROR")
             return False
         
         # Early check: Verify target disk is not the boot/system disk
@@ -1477,7 +1484,10 @@ extend
             self.log("=" * 60, "ERROR")
             return False
 
-        # If raw mode requested, use the simpler raw clone method
+        # If raw mode requested, use the simpler raw clone method. This is the
+        # preferred path for clean-slate OS disk replacement because it copies
+        # every sector up to the source disk size: partition table, boot sectors,
+        # hidden partitions, registry hives, ACLs, and data files.
         if use_raw_mode:
             clone_success = self.clone_disk_raw(source_disk_index, target_disk_index)
             
@@ -1523,11 +1533,6 @@ extend
         self.log("=" * 60)
         self.log(f"Starting disk-to-disk clone: Disk {source_disk_index} -> Disk {target_disk_index}")
         self.log("=" * 60)
-
-        # Validate source and target are different
-        if source_disk_index == target_disk_index:
-            self.log("ERROR: Source and target disk cannot be the same!", "ERROR")
-            return False
 
         # Verify target disk is safe (not system disk)
         if not self.verify_disk_writable(target_disk_index):
@@ -1726,8 +1731,11 @@ Examples:
   # Clone drive C: to image
   python disk_cloner.py --clone-drive C: --output E:\\Backups
 
-  # Clone disk 0 to disk 1
+  # Clone disk 0 to disk 1 using RAW mode (default, best for OS clones)
   python disk_cloner.py --clone-disk 0 1
+
+  # Fallback file-level clone if RAW access is blocked
+  python disk_cloner.py --clone-disk 0 1 --filesystem-mode
         """
     )
 
@@ -1736,7 +1744,9 @@ Examples:
     parser.add_argument('--clone-drive', metavar='DRIVE',
                         help='Clone a specific drive (e.g., C:)')
     parser.add_argument('--clone-disk', nargs=2, metavar=('SOURCE', 'TARGET'),
-                        help='Clone entire disk (source_index target_index)')
+                        help='Clone entire disk (source_index target_index); RAW mode is used by default')
+    parser.add_argument('--filesystem-mode', action='store_true',
+                        help='Use robocopy file-level disk cloning instead of RAW sector-by-sector cloning')
     parser.add_argument('--output', metavar='DIR',
                         help='Output directory for image files')
     parser.add_argument('--no-verify', action='store_true',
@@ -1800,7 +1810,12 @@ Examples:
         print("=" * 60)
         print(f"Source disk: {source_idx}")
         print(f"Target disk: {target_idx}")
+        mode = 'filesystem/robocopy fallback' if args.filesystem_mode else 'RAW sector-by-sector (default)'
+        print(f"Clone mode: {mode}")
         print("\nThis will OVERWRITE all data on the target disk!")
+        if args.filesystem_mode:
+            print("WARNING: Filesystem mode is not an exact sector copy of a live OS disk.")
+            print("Use RAW mode for the most complete clean-slate OS-drive clone.")
         print("=" * 60)
 
         response = input("\nAre you sure you want to continue? (yes/no): ")
@@ -1808,7 +1823,7 @@ Examples:
             print("Operation cancelled.")
             return 0
 
-        success = cloner.clone_disk_to_disk(source_idx, target_idx)
+        success = cloner.clone_disk_to_disk(source_idx, target_idx, use_raw_mode=not args.filesystem_mode)
         return 0 if success else 1
 
     # No action specified
