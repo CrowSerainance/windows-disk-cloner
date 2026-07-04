@@ -17,6 +17,7 @@ import hashlib
 import shutil
 import time
 import re
+import tempfile
 from pathlib import Path
 from datetime import datetime
 import argparse
@@ -165,7 +166,7 @@ class DiskCloner:
             
             wmi_client = self._get_wmi_client()
             for partition in wmi_client.Win32_DiskPartition():
-                if partition.DiskIndex == disk_index:
+                if int(partition.DiskIndex) == disk_index:
                     for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
                         if logical_disk.DeviceID == system_drive:
                             self.log(f"ERROR: Disk {disk_index} contains system drive {system_drive}!", "ERROR")
@@ -187,6 +188,21 @@ class DiskCloner:
         except Exception as e:
             self.log(f"Error verifying disk: {e}", "ERROR")
             return False
+
+        try:
+            storage_client = wmi.WMI(namespace=r"root\Microsoft\Windows\Storage")
+            for disk in storage_client.MSFT_Disk(Number=int(disk_index)):
+                is_boot = bool(getattr(disk, 'IsBoot', False))
+                is_system = bool(getattr(disk, 'IsSystem', False))
+                is_read_only = bool(getattr(disk, 'IsReadOnly', False))
+                if is_boot or is_system:
+                    self.log(f"ERROR: Disk {disk_index} is marked as boot/system by Windows Storage API!", "ERROR")
+                    return False
+                if is_read_only:
+                    self.log(f"ERROR: Disk {disk_index} is read-only!", "ERROR")
+                    return False
+        except Exception as e:
+            self.log(f"Storage API safety check unavailable: {e}", "WARNING")
 
         return True
 
@@ -929,7 +945,7 @@ try {{
         # Calculate how many bytes we can still read
         $remainingBytes = $totalBytes - $copiedBytes
         # Use Int64 for large values, cast to ensure proper type
-        $bytesToRead = [long][math]::Min([long]$bufferSize, [long]$remainingBytes)
+        $bytesToRead = [int][math]::Min([long]$bufferSize, [long]$remainingBytes)
         
         try {{
             $bytesRead = $sourceStream.Read($buffer, 0, $bytesToRead)
@@ -1245,56 +1261,48 @@ extend
         self.log("Changing disk signature to ensure cloned disk is unique...")
         
         try:
-            # Use diskpart to change the disk signature
-            # This is important because Windows uses disk signatures to identify disks
-            # If both disks have the same signature, Windows may get confused
-            
-            # For GPT disks, we can't easily change the disk GUID via diskpart
-            # But Windows will handle duplicate signatures automatically
-            # The important thing is that the boot configuration is set up correctly
-            # which we do in configure_boot_loader()
-            
-            # For MBR disks, we can change the signature, but it's not always necessary
-            # Windows handles this automatically in most cases
-            
-            # Instead, we'll just log that the disk is ready
-            self.log("Disk signature: Cloned disk will have unique identifier", "INFO")
-            self.log("Windows automatically handles disk identification after cloning", "INFO")
-            return True
-            
-            script_path = os.path.join(os.environ.get('TEMP', 'C:\\Windows\\Temp'), 'diskpart_sig.txt')
-            try:
-                with open(script_path, 'w', encoding='utf-8') as f:
-                    f.write(change_sig_script)
-                
-                result = subprocess.run(
-                    ['diskpart', '/s', script_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
+            partition_style = self.get_disk_partition_style(target_disk_index)
+
+            if partition_style == 'MBR':
+                # Give MBR clones a fresh 32-bit signature. Duplicate disk
+                # signatures can leave the clone offline or confuse drive-letter
+                # assignment when source and target are attached together.
+                new_signature = f"{int.from_bytes(os.urandom(4), 'big'):08X}"
+                change_sig_script = f"""select disk {target_disk_index}
+uniqueid disk id={new_signature}
+"""
+                script_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f'diskpart_sig_{os.getpid()}_{target_disk_index}.txt'
                 )
-                
-                if result.returncode == 0:
-                    self.log("Disk signature changed successfully", "SUCCESS")
-                    self.log("The cloned disk now has a unique identifier", "INFO")
-                    return True
-                else:
-                    # Signature change may not be critical - log but don't fail
-                    self.log(f"Could not change disk signature: {result.stderr}", "WARNING")
-                    self.log("This is usually not critical - the disk should still work", "INFO")
-                    return True
-                    
-            except Exception as e:
-                self.log(f"Error changing disk signature: {e}", "WARNING")
-                self.log("This is usually not critical - continuing...", "INFO")
-                return True
-            finally:
                 try:
-                    if os.path.exists(script_path):
-                        os.remove(script_path)
-                except:
-                    pass
-                    
+                    with open(script_path, 'w', encoding='utf-8') as f:
+                        f.write(change_sig_script)
+
+                    result = subprocess.run(
+                        ['diskpart', '/s', script_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+
+                    output = (result.stdout or '') + (result.stderr or '')
+                    if result.returncode == 0 and 'error' not in output.lower():
+                        self.log(f"Disk signature changed successfully to {new_signature}", "SUCCESS")
+                    else:
+                        self.log(f"Could not change disk signature: {output.strip()}", "WARNING")
+                        self.log("This is usually not critical - continuing...", "INFO")
+                    return True
+                finally:
+                    try:
+                        if os.path.exists(script_path):
+                            os.remove(script_path)
+                    except Exception:
+                        pass
+
+            self.log("GPT disk detected; Windows will handle duplicate disk GUIDs on first online/import.", "INFO")
+            return True
+
         except Exception as e:
             self.log(f"Disk signature change skipped: {e}", "WARNING")
             return True  # Don't fail the operation
